@@ -81,12 +81,11 @@ ffi.cdef[[
     int ogg_page_eos(ogg_page *og);
 ]]
 
--- dont touch or crash
 local function file_read(self, bytes)
     if self.source_type == "stream" then
         if not self.file then return nil end
         local chunk = self.file:read(bytes)
-
+        -- love gives "" at eof not nil, so check the length or it hangs forever
         if not chunk or #chunk == 0 then return false end  -- EOF
         return chunk
     else
@@ -112,7 +111,6 @@ local function get_page(self)
             ffi.copy(buffer, chunk, #chunk)
             ogg.ogg_sync_wrote(self.sync, #chunk)
         elseif result == -1 then
-            -- Not synced yet
         end
     until result == 1
 
@@ -139,17 +137,13 @@ local function get_packet(self)
             if not page then return nil end
             ogg.ogg_stream_pagein(self.stream, page)
         elseif result == -1 then
-            -- keep trying
         end
     until result == 1
 
     return packet
 end
 
--- Scans the whole stream once to find the last granule position (= duration).
--- Works for both source types now:
---   static sources scan the in-memory filedata, as before.
---   stream  sources scan through the real file handle. Since that handle
+-- scans the whole file for the last granule (the length), then puts the file position back
 local function compute_duration(self)
     local temp, savedPos
 
@@ -199,12 +193,12 @@ local function compute_duration(self)
         end
     end
 
-    -- Clean up
     if stream_initialized then
         ogg.ogg_stream_clear(stream)
     end
     ogg.ogg_sync_clear(sync)
 
+    -- take off the pre-skip padding or the length overshoots
     self.duration_samples = math.max(0, last_granule - (self.pre_skip or 0))
 
     if self.source_type == "stream" and savedPos then
@@ -228,20 +222,17 @@ function OpusPlayer.newSource(filename, source_type)
     end
 
     if source_type == "stream" then
-        -- Open file handle for streaming
         self.file = love.filesystem.openFile(filename, "r")
         if not self.file then
             error("Failed to open file: " .. filename)
         end
 
-        -- Verify Ogg container
         local magic = self.file:read(4)
         if magic ~= "OggS" then
             error("Not a valid Ogg file")
         end
         self.file:seek(0)
     else
-        -- Load entire file into memory for static
         self.filedata = love.filesystem.read(filename)
         self.filepos = 0
 
@@ -249,26 +240,23 @@ function OpusPlayer.newSource(filename, source_type)
             error("Failed to read file: " .. filename)
         end
 
-        -- Verify Ogg container
         if self.filedata:sub(1, 4) ~= "OggS" then
             error("Not a valid Ogg file")
         end
+
     end
 
-    -- Initialize Ogg sync/stream
     self.sync = ffi.new("ogg_sync_state")
     self.stream = ffi.new("ogg_stream_state")
     self.stream_initialized = false
     ogg.ogg_sync_init(self.sync)
 
-    -- Skip headers
     for i = 1, 2 do
         local packet = get_packet(self)
         if not packet then
             error("Failed to read header packet " .. i)
         end
 
-        -- Verify first packet is OpusHead
         if i == 1 then
             local bytes = tonumber(packet.bytes)
             local header = ffi.string(packet.packet, math.min(8, bytes))
@@ -276,22 +264,20 @@ function OpusPlayer.newSource(filename, source_type)
                 error("Not a valid Opus file")
             end
 
+            -- pre-skip = padding samples at the start the encoder wants skipped
             self.pre_skip = (bytes >= 12) and (packet.packet[10] + packet.packet[11] * 256) or 0
         end
     end
 
-    -- Default to 48kHz stereo
     local samplerate = 48000
     local channels = 2
 
-    -- Create Opus decoder
     local err = ffi.new("int[1]")
     self.decoder = opus.opus_decoder_create(samplerate, channels, err)
     if err[0] ~= 0 then
         error("Failed to create Opus decoder: " .. err[0])
     end
 
-    -- Create audio source
     self.source = love.audio.newQueueableSource(samplerate, 16, channels)
     self.samplerate = samplerate
     self.channels = channels
@@ -306,13 +292,9 @@ function OpusPlayer.newSource(filename, source_type)
 
     self.packets_decoded = 0
     self.finished = false
+    self.wanted = false -- wont play til play() is called
 
-    -- Reused across every decoded packet instead of allocating a fresh
-    -- ffi.new("short[?]", ...) each time update() queues one (see update()
-    -- below) — with several of these running at once (a multi-stem chart's
-    -- StemPlayer drives one OpusPlayer per stem, every frame), that was a
-    -- lot of avoidable allocation/GC churn on top of the much bigger cost
-    -- fixed there.
+    -- reused for every packet so we dont make garbage every frame
     self.pcmBuffer = ffi.new("short[?]", OPUS_BLOCK_SIZE * 2)
 
     return self
@@ -323,14 +305,14 @@ function OpusPlayer:getType()
 end
 
 function OpusPlayer:play()
-    if self.source and not self.user_paused then return end
+    if not self.source then return end
     self.user_paused = false
-    self.source:play()
+    self.wanted = true
+    if self.packets_decoded > 0 then self.source:play() end
 end
 
 function OpusPlayer:pause()
     if not self.source or self.user_paused then return end
-    print("pause press")
     self.user_paused = true
     self.source:pause()
 end
@@ -340,8 +322,8 @@ function OpusPlayer:stop()
 
     self.source:stop()
     self.stopped = true
+    self.wanted = false
 
-    -- Reset playback
     self.decoded_samples = 0
     self.played_samples = 0
     self.queued_samples = 0
@@ -358,7 +340,6 @@ function OpusPlayer:stop()
         end
     end
 
-    -- Reinitialize Ogg stream state
     if self.stream_initialized then
         ogg.ogg_stream_clear(self.stream)
         self.stream_initialized = false
@@ -368,13 +349,36 @@ function OpusPlayer:stop()
         ogg.ogg_sync_init(self.sync)
     end
 
-    -- Skip again
     for i = 1, 2 do
         local packet = get_packet(self)
         if not packet then
             error("Failed to read header packet " .. i .. " after stop")
         end
     end
+end
+
+-- opus cant jump to a time so decode and throw away everything up to t
+function OpusPlayer:seek(t)
+    if not self.source then return end
+    local wanted = self.wanted
+    self:stop()
+    local target, skipped = math.floor((t or 0) * self.samplerate), 0
+    while skipped < target do
+        local packet = get_packet(self)
+        if not packet then break end
+        local n = opus.opus_decode(self.decoder, packet.packet, tonumber(packet.bytes), self.pcmBuffer, OPUS_BLOCK_SIZE, 0)
+        if n <= 0 then break end
+        skipped = skipped + n
+    end
+    self.decoded_samples = skipped
+    self.played_samples = skipped
+    self.wanted = wanted
+end
+
+function OpusPlayer:release()
+    if self.source then self.source:stop() end
+    if self.file then self.file:close(); self.file = nil end
+    self.source = nil
 end
 
 function OpusPlayer:setVolume(volume)
@@ -430,11 +434,10 @@ function OpusPlayer:update(packets_per_frame)
 
     local free = self.source:getFreeBufferCount()
 
-    -- Calculate how many buffers were consumed since last update
+    -- buffers that finished playing since last frame
     if self.last_free_buffers then
         local buffers_consumed = free - self.last_free_buffers
 
-        -- Remove consumed buffers from tracking
         for i = 1, buffers_consumed do
             local samples = table.remove(self.buffer_samples, 1)
             if samples then
@@ -443,10 +446,8 @@ function OpusPlayer:update(packets_per_frame)
         end
     end
 
-    -- Store current free count BEFORE queuing new buffers
     local free_before_queue = free
 
-    -- Queue new buffers
     if free > 0 then
         for _ = 1, math.min(free, packets_per_frame) do
             local packet = get_packet(self)
@@ -467,6 +468,8 @@ function OpusPlayer:update(packets_per_frame)
 
             if samples > 0 then
                 local sd = love.sound.newSoundData(samples, self.samplerate, 16, self.channels)
+
+                -- opus decodes straight to 16-bit pcm so just copy the whole block in
                 ffi.copy(sd:getPointer(), pcm, samples * self.channels * 2)
 
                 self.source:queue(sd)
@@ -483,19 +486,59 @@ function OpusPlayer:update(packets_per_frame)
             end
         end
 
-        if not self.source:isPlaying() and self.packets_decoded > 0 and not self.finished and not self.user_paused then
+        if self.wanted and not self.source:isPlaying() and self.packets_decoded > 0 and not self.finished and not self.user_paused then
             self.source:play()
         end
     end
 
-    -- Recalculate queued_samples from buffer_samples array
     self.queued_samples = 0
     for _, samples in ipairs(self.buffer_samples) do
         self.queued_samples = self.queued_samples + samples
     end
 
-    -- Store free count AFTER queuing for next frame
     self.last_free_buffers = self.source:getFreeBufferCount()
+end
+
+-- decodes the whole song in one go for pre-mixing stems, trimmed to match getDuration()
+function OpusPlayer:decodeAllPCM()
+    local durationSamples = self:getDuration("samples")
+    if durationSamples <= 0 then return ffi.new("int16_t[?]", 1), 0 end
+
+    local capacity = durationSamples + (self.pre_skip or 0) + OPUS_BLOCK_SIZE
+    local out = ffi.new("int16_t[?]", capacity * self.channels)
+    local writePos = 0
+
+    while true do
+        local packet = get_packet(self)
+        if not packet then break end
+        local bytes = tonumber(packet.bytes)
+        if bytes == 0 then break end
+
+        local samples = opus.opus_decode(self.decoder, packet.packet, bytes, self.pcmBuffer, OPUS_BLOCK_SIZE, 0)
+        if samples <= 0 then break end
+
+        local neededEnd = writePos + samples
+        if neededEnd > capacity then
+            -- decoded more than expected, grow instead of cutting the end off
+            local newCapacity = neededEnd + OPUS_BLOCK_SIZE
+            local bigger = ffi.new("int16_t[?]", newCapacity * self.channels)
+            ffi.copy(bigger, out, writePos * self.channels * 2)
+            out = bigger
+            capacity = newCapacity
+        end
+
+        ffi.copy(out + writePos * self.channels, self.pcmBuffer, samples * self.channels * 2)
+        writePos = writePos + samples
+    end
+
+    -- trim the pre-skip and cap at the real length so stems line up
+    local preSkip = self.pre_skip or 0
+    local keep = math.min(durationSamples, math.max(0, writePos - preSkip))
+    local trimmed = ffi.new("int16_t[?]", math.max(keep, 1) * self.channels)
+    if keep > 0 then
+        ffi.copy(trimmed, out + preSkip * self.channels, keep * self.channels * 2)
+    end
+    return trimmed, keep
 end
 
 function OpusPlayer:getStats()
