@@ -320,7 +320,12 @@ end
 function OpusPlayer:stop()
     if not self.source then return end
 
+    -- love wont free queued buffers if the source never played, so start fresh
+    local vol = self.source:getVolume()
     self.source:stop()
+    self.source:release()
+    self.source = love.audio.newQueueableSource(self.samplerate, 16, self.channels)
+    self.source:setVolume(vol)
     self.stopped = true
     self.wanted = false
 
